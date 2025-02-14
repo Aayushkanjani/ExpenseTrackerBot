@@ -20,5 +20,4 @@ groq
 nltk
 sentence-transformers
 pymongo
-bson
 gunicorn
