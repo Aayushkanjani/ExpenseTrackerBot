@@ -1,8 +1,8 @@
+import os
 import re
 import json
 import logging
-import os
-from datetime import datetime, timedelta
+from datetime import datetime
 import dateparser
 from flask import Flask, request, jsonify
 from word2number import w2n
@@ -15,51 +15,45 @@ from sentence_transformers import SentenceTransformer, util
 
 # Import PyMongo and ObjectId for MongoDB integration
 from pymongo import MongoClient
-from bson import ObjectId
+from bson.tz_util import utc
+
+from twilio.twiml.messaging_response import MessagingResponse
 
 # -------------------------------
-# Logging configuration
+# Hardcoded Environment Variables
+# -------------------------------
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+# MONGO_URI = "mongodb://localhost:27017"
+MONGO_URI = os.environ.get("MONGO_URI")
+MONGO_DB_NAME = os.environ.get("expense_tracker1")
+MONGO_COLLECTION = os.environ.get("expenses")
+
+# -------------------------------
+# Logging Configuration
 # -------------------------------
 logging.basicConfig(
     level=logging.DEBUG,
-    format='%(asctime)s [%(levelname)s] %(message)s'
+    format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
 # -------------------------------
-# Load Sentence Transformer model and precompute canonical category embeddings
-# -------------------------------
-embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-canonical_categories = list({
-    "ATM", "Auto", "Bars", "Beauty", "Cashback", "Clothing", "Coffee Shops",
-    "Credit Card Payment", "Education", "Entertainment", "Fees", "Food",
-    "Fuel", "Gifts", "Groceries", "Gym", "Home", "Housing", "Income",
-    "Insurance", "Medical", "Pets", "Pharmacy", "Restaurants", "Services",
-    "Shopping", "Streaming", "Taxes", "Technology", "Transportation",
-    "Travel", "Transfer", "Utilities", "Beverages", "Other"
-})
-category_embeddings = embedding_model.encode(canonical_categories, convert_to_tensor=True)
-
-def get_category_vector(item):
-    # Compute the embedding for the input item
-    item_embedding = embedding_model.encode(item, convert_to_tensor=True)
-    # Compute cosine similarities with canonical category embeddings
-    cosine_scores = util.cos_sim(item_embedding, category_embeddings)
-    best_idx = cosine_scores.argmax().item()
-    best_category = canonical_categories[best_idx]
-    return best_category
-
-# -------------------------------
-# MongoDB Client Class using PyMongo
+# MongoDB Client Class using PyMongo (Local Connection)
 # -------------------------------
 class MongoDBClient:
     def __init__(self, uri, db_name, collection_name):
-        self.client = MongoClient(uri)
-        self.db = self.client[db_name]
-        self.collection = self.db[collection_name]
+        logging.info(f"Connecting to MongoDB at {uri}...")
+        try:
+            self.client = MongoClient(uri, serverSelectionTimeoutMS=5000, directConnection=False)
+            self.db = self.client[db_name]
+            self.collection = self.db[collection_name]
+            self.client.admin.command("ping")
+            logging.info("✅ Successfully connected to MongoDB!")
+        except Exception as e:
+            logging.error(f"❌ MongoDB Connection Failed: {e}")
+            raise e
 
     def insert(self, record):
         result = self.collection.insert_one(record)
-        # Store the inserted _id as a string in the record for consistency.
         record["expense_id"] = str(result.inserted_id)
         return record["expense_id"]
 
@@ -76,8 +70,34 @@ class MongoDBClient:
             return result.deleted_count > 0
         return False
 
+db_client = MongoDBClient(MONGO_URI, MONGO_DB_NAME, MONGO_COLLECTION)
+
 # -------------------------------
-# Legacy Category Mapping (for fallback filtering)
+# Load Sentence Transformer Model and Precompute Canonical Category Embeddings
+# -------------------------------
+embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+canonical_categories = [
+    "ATM", "Auto", "Bars", "Beauty", "Cashback", "Clothing", "Coffee Shops",
+    "Credit Card Payment", "Education", "Entertainment", "Fees", "Food",
+    "Fuel", "Gifts", "Groceries", "Gym", "Home", "Housing", "Income",
+    "Insurance", "Medical", "Pets", "Pharmacy", "Restaurants", "Services",
+    "Shopping", "Streaming", "Taxes", "Technology", "Transportation",
+    "Travel", "Transfer", "Utilities", "Beverages", "Other"
+]
+category_embeddings = embedding_model.encode(canonical_categories, convert_to_tensor=True)
+
+def get_category_vector(item, threshold=0.5):
+    item_embedding = embedding_model.encode(item, convert_to_tensor=True)
+    cosine_scores = util.cos_sim(item_embedding, category_embeddings)
+    best_idx = cosine_scores.argmax().item()
+    best_score = cosine_scores[0][best_idx].item()
+    if best_score < threshold:
+        logging.info(f"Low confidence for '{item}' (score={best_score:.2f}); falling back to LLM mapping.")
+        return None
+    return canonical_categories[best_idx]
+
+# -------------------------------
+# Legacy Category Mapping (Fallback)
 # -------------------------------
 CATEGORY_MAPPING = {
     "ATM": ["atm", "cash", "withdraw"],
@@ -126,7 +146,7 @@ def get_category(item):
     return "Other"
 
 # -------------------------------
-# Helper Function: Convert Number Words to Digits (with hyphen support)
+# Helper Function: Convert Number Words to Digits
 # -------------------------------
 def convert_number_words(text):
     number_word_list = [
@@ -157,12 +177,12 @@ class GroqLLMClient:
     def __init__(self, api_key):
         self.client = Groq(api_key=api_key)
     
-    def get_response(self, prompt):
+    def get_response(self, prompt, model="llama-3.3-70b-versatile"):
         logging.debug(f"Groq LLM Prompt: {prompt}")
         try:
             chat_completion = self.client.chat.completions.create(
                 messages=[{"role": "user", "content": prompt}],
-                model="llama-3.3-70b-versatile",
+                model=model
             )
             text = chat_completion.choices[0].message.content.strip()
             logging.debug(f"Groq LLM Response: {text}")
@@ -170,10 +190,30 @@ class GroqLLMClient:
         except Exception as e:
             logging.error(f"Groq LLM API error: {e}")
             raise e
+    
+    def transcribe_voice(self, media_url):
+        logging.debug(f"Transcribing voice from URL: {media_url}")
+        try:
+            transcription = self.client.audio.transcriptions.create(
+                media_url=media_url,
+                model="whisper-large-v3-turbo",
+                prompt="Transcribe the following voice note.",
+                response_format="json",
+                language="en",
+                temperature=0.0
+            )
+            text = transcription
+            logging.debug(f"Voice transcription result: {text}")
+            return text
+        except Exception as e:
+            logging.error(f"Error transcribing voice: {e}")
+            raise e
+
+
+llm_client = GroqLLMClient(GROQ_API_KEY)
 
 # -------------------------------
-# ExpenseTracker Class with LLM-Only Typo Correction and Dynamic Synonym Mapping
-# (Using WordNet and Vector Similarity; hardcoding eliminated)
+# ExpenseTracker Class
 # -------------------------------
 class ExpenseTracker:
     def __init__(self, llm_client, db_client):
@@ -181,14 +221,14 @@ class ExpenseTracker:
         self.db = db_client
 
     def correct_typos(self, message):
+        prompt = (
+            "Please carefully review the following message for any spelling, grammatical, or typographical errors. "
+            "Correct all errors while preserving the exact original meaning and tone. Do not alter the structure or content "
+            "of the message, and return only the corrected text without any additional commentary. "
+            "For example, if you see 'spenrt', correct it to 'spent'.\n"
+            f"Message: \"{message}\""
+        )
         try:
-            prompt = (
-                "Please carefully review the following message for any spelling, grammatical, or typographical errors. "
-                "Correct all errors while preserving the exact original meaning and tone. Do not alter the structure or content "
-                "of the message, and return only the corrected text without any additional commentary. "
-                "For example, if you see 'spenrt', correct it to 'spent'.\n"
-                f"Message: \"{message}\""
-            )
             corrected = self.llm_client.get_response(prompt)
             if corrected:
                 logging.info(f"Typo correction: '{message}' corrected to '{corrected}'")
@@ -201,10 +241,12 @@ class ExpenseTracker:
         word = word.lower().strip()
         logging.debug(f"Mapping '{word}' dynamically using hybrid approach.")
         try:
-            # Use vector similarity to get the best matching canonical category.
-            vector_category = get_category_vector(word)
-            logging.info(f"Vector similarity mapping: {word} -> {vector_category}")
-            return vector_category
+            vector_category = get_category_vector(word, threshold=0.5)
+            if vector_category is not None:
+                logging.info(f"Vector similarity mapping: {word} -> {vector_category}")
+                return vector_category
+            else:
+                raise ValueError("Cosine similarity below threshold.")
         except Exception as e:
             logging.error(f"Vector similarity mapping failed for {word}: {e}")
             prompt = (
@@ -223,7 +265,6 @@ class ExpenseTracker:
 
     def process_message_with_llm(self, message, mode):
         current_date = datetime.now().strftime("%Y-%m-%d")
-        logging.debug(f"Processing message with LLM in mode {mode}: {message}")
         if mode == "add":
             prompt = (
                 "Extract all expense entries from the following message. Return a JSON list where each expense "
@@ -248,7 +289,6 @@ class ExpenseTracker:
             )
         else:
             return {}
-        
         try:
             response = self.llm_client.get_response(prompt)
             data = json.loads(response)
@@ -261,7 +301,6 @@ class ExpenseTracker:
     def regex_fallback(self, message, mode):
         logging.debug(f"Using regex fallback for mode {mode}: {message}")
         if mode == "query":
-            # Improved fallback: capture any text following "on" or "for"
             items_match = re.search(r"(?:for|on)\s+(.+)", message, re.IGNORECASE)
             if items_match:
                 items_str = items_match.group(1).strip()
@@ -274,7 +313,6 @@ class ExpenseTracker:
             return fallback_query
         elif mode == "add":
             processed_message = convert_number_words(message)
-            logging.debug(f"Processed message after number conversion: {processed_message}")
             pattern = r"(?:(\d+)\s*(?:rs|\$|₹|dollars|rupees)?\s*(?:on|for)\s*([\w\s]+))|(\d+)\s*(?:rs|\$|₹|dollars|rupees)?\b"
             matches = re.findall(pattern, processed_message, flags=re.IGNORECASE)
             entries = []
@@ -308,11 +346,9 @@ class ExpenseTracker:
 
     def add_expense(self, message, user_id):
         corrected_message = self.correct_typos(message)
-        logging.debug(f"Corrected message: {corrected_message}")
         expenses = self.process_message_with_llm(corrected_message, mode="add")
         if not expenses:
             return "No valid expense entries found."
-        
         responses = []
         for entry in expenses:
             if entry.get("amount") is None:
@@ -349,7 +385,6 @@ class ExpenseTracker:
         query_data = self.process_message_with_llm(corrected_message, mode="query")
         if "items" not in query_data or not query_data["items"]:
             query_data = {"items": ["all"], "time_range": None}
-        
         total = 0
         response_details = []
         for item in query_data.get("items", []):
@@ -394,12 +429,12 @@ class ExpenseTracker:
         return f"Expense {expense_id} not found."
 
     def classify_intent(self, message):
+        prompt = (
+            "Classify the intent of the following message as one of: 'add expense', 'query expense', or 'delete expense'. "
+            "Return only the intent as a single word: add, query, or delete.\n"
+            f"Message: \"{message}\""
+        )
         try:
-            prompt = (
-                "Classify the intent of the following message as one of: 'add expense', 'query expense', or 'delete expense'. "
-                "Return only the intent as a single word: add, query, or delete.\n"
-                f"Message: \"{message}\""
-            )
             intent = self.llm_client.get_response(prompt).strip().lower()
             logging.debug(f"LLM intent classification: {intent}")
             if 'add' in intent or 'lend' in intent:
@@ -434,56 +469,11 @@ class ExpenseTracker:
         else:
             return "I didn’t understand that. Try 'add expense' or 'show expenses.'"
 
-# -------------------------------
-# Flask and Twilio WhatsApp Integration
-# -------------------------------
-app = Flask(__name__)
-from dotenv import load_dotenv
-load_dotenv()
-
-groq_api_key = os.environ.get("GROQ_API_KEY")
-if not groq_api_key:
-    raise Exception("Please set the GROQ_API_KEY environment variable.")
-
-# For MongoDB, get environment variables:
-mongo_uri = os.environ.get("MONGO_URI")
-mongo_db_name = os.environ.get("MONGO_DB", "expense_tracker")
-mongo_collection = os.environ.get("MONGO_COLLECTION", "expenses")
-if not mongo_uri:
-    raise Exception("Please set the MONGO_URI environment variable.")
-
-# Create the Groq LLM client and MongoDB client
-llm_client = GroqLLMClient(groq_api_key)
-from pymongo import MongoClient
-from bson import ObjectId
-
-class MongoDBClient:
-    def __init__(self, uri, db_name, collection_name):
-        self.client = MongoClient(uri)
-        self.db = self.client[db_name]
-        self.collection = self.db[collection_name]
-
-    def insert(self, record):
-        result = self.collection.insert_one(record)
-        record["expense_id"] = str(result.inserted_id)
-        return record["expense_id"]
-
-    def find(self, query):
-        results = list(self.collection.find(query))
-        for rec in results:
-            rec["expense_id"] = str(rec.get("_id"))
-        return results
-
-    def delete(self, query):
-        expense_id = query.get("expense_id")
-        if expense_id:
-            result = self.collection.delete_one({"_id": ObjectId(expense_id), "user_id": query.get("user_id")})
-            return result.deleted_count > 0
-        return False
-
-db_client = MongoDBClient(mongo_uri, mongo_db_name, mongo_collection)
-
+llm_client = GroqLLMClient(GROQ_API_KEY)
+db_client = MongoDBClient(MONGO_URI, MONGO_DB_NAME, MONGO_COLLECTION)
 tracker = ExpenseTracker(llm_client, db_client)
+
+app = Flask(__name__)
 
 @app.route('/process_command', methods=['POST'])
 def process_command_route():
@@ -496,14 +486,21 @@ def process_command_route():
 
 @app.route('/whatsapp', methods=['POST'])
 def whatsapp_reply():
-    incoming_msg = request.form.get('Body', '')
+    incoming_msg = request.form.get('Body', '').strip()
     from_number = request.form.get('From', '')
     user_id = from_number
     logging.info(f"Received WhatsApp message from {user_id}: {incoming_msg}")
-    
+    media_url = request.form.get('MediaUrl0', '')
+    media_type = request.form.get('MediaContentType0', '')
+    # If an audio file is provided, download and transcribe it.
+    if media_url and "audio" in media_type.lower():
+        try:
+            incoming_msg = llm_client.transcribe_voice(media_url)
+            logging.info(f"Transcribed voice message: {incoming_msg}")
+        except Exception as e:
+            logging.error(f"Voice transcription failed: {e}")
+            incoming_msg = "Voice transcription failed."
     response_text = tracker.process_command(incoming_msg, user_id)
-    
-    from twilio.twiml.messaging_response import MessagingResponse
     resp = MessagingResponse()
     msg = resp.message()
     msg.body(response_text)
@@ -511,5 +508,4 @@ def whatsapp_reply():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port,debug=False)
-
+    app.run(host='0.0.0.0', port=port, debug=True)
