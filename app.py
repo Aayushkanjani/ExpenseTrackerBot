@@ -44,8 +44,8 @@ class MongoDBClient:
         logging.info(f"Connecting to MongoDB at {uri}...")
         try:
             self.client = MongoClient(uri, serverSelectionTimeoutMS=5000, directConnection=False)
-            self.db = self.client[db_name]
-            self.collection = self.db[collection_name]
+            self.db = self.client[str(db_name)]
+            self.collection = self.db[str(collection_name)]
             self.client.admin.command("ping")
             logging.info("✅ Successfully connected to MongoDB!")
         except Exception as e:
