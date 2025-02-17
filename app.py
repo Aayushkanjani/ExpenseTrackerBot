@@ -5,13 +5,12 @@ import logging
 from datetime import datetime
 import dateparser
 from flask import Flask, request, jsonify
-from word2number import w2n
+
+# Use the Hugging Face Inference API instead of a locally downloaded model.
+from huggingface_hub import InferenceClient
 
 # Import the official Groq client
 from groq import Groq
-
-# Import SentenceTransformer for vector embeddings
-from sentence_transformers import SentenceTransformer, util
 
 # Import PyMongo and ObjectId for MongoDB integration
 from pymongo import MongoClient
@@ -22,11 +21,12 @@ from twilio.twiml.messaging_response import MessagingResponse
 # -------------------------------
 # Hardcoded Environment Variables
 # -------------------------------
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+HUGGINGFACE_API_KEY =  os.getenv("HUGGINGFACE_API_KEY")  # Replace with your Hugging Face API key
 # MONGO_URI = "mongodb://localhost:27017"
-MONGO_URI = os.environ.get("MONGO_URI")
-MONGO_DB_NAME = os.environ.get("expense_tracker1")
-MONGO_COLLECTION = os.environ.get("expenses")
+MONGO_URI = os.getenv("MONGO_URI")
+MONGO_DB_NAME = "expense_tracker1"
+MONGO_COLLECTION = "expenses"
 
 # -------------------------------
 # Logging Configuration
@@ -37,45 +37,13 @@ logging.basicConfig(
 )
 
 # -------------------------------
-# MongoDB Client Class using PyMongo (Local Connection)
+# Hugging Face Inference Client for Sentence Similarity
 # -------------------------------
-class MongoDBClient:
-    def __init__(self, uri, db_name, collection_name):
-        logging.info(f"Connecting to MongoDB at {uri}...")
-        try:
-            self.client = MongoClient(uri, serverSelectionTimeoutMS=5000, directConnection=False)
-            self.db = self.client[str(db_name)]
-            self.collection = self.db[str(collection_name)]
-            self.client.admin.command("ping")
-            logging.info("✅ Successfully connected to MongoDB!")
-        except Exception as e:
-            logging.error(f"❌ MongoDB Connection Failed: {e}")
-            raise e
-
-    def insert(self, record):
-        result = self.collection.insert_one(record)
-        record["expense_id"] = str(result.inserted_id)
-        return record["expense_id"]
-
-    def find(self, query):
-        results = list(self.collection.find(query))
-        for rec in results:
-            rec["expense_id"] = str(rec.get("_id"))
-        return results
-
-    def delete(self, query):
-        expense_id = query.get("expense_id")
-        if expense_id:
-            result = self.collection.delete_one({"_id": ObjectId(expense_id), "user_id": query.get("user_id")})
-            return result.deleted_count > 0
-        return False
-
-db_client = MongoDBClient(MONGO_URI, MONGO_DB_NAME, MONGO_COLLECTION)
+hf_client = InferenceClient(provider="hf-inference", api_key=HUGGINGFACE_API_KEY)
 
 # -------------------------------
-# Load Sentence Transformer Model and Precompute Canonical Category Embeddings
+# Canonical Categories
 # -------------------------------
-embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 canonical_categories = [
     "ATM", "Auto", "Bars", "Beauty", "Cashback", "Clothing", "Coffee Shops",
     "Credit Card Payment", "Education", "Entertainment", "Fees", "Food",
@@ -84,17 +52,28 @@ canonical_categories = [
     "Shopping", "Streaming", "Taxes", "Technology", "Transportation",
     "Travel", "Transfer", "Utilities", "Beverages", "Other"
 ]
-category_embeddings = embedding_model.encode(canonical_categories, convert_to_tensor=True)
 
 def get_category_vector(item, threshold=0.5):
-    item_embedding = embedding_model.encode(item, convert_to_tensor=True)
-    cosine_scores = util.cos_sim(item_embedding, category_embeddings)
-    best_idx = cosine_scores.argmax().item()
-    best_score = cosine_scores[0][best_idx].item()
-    if best_score < threshold:
-        logging.info(f"Low confidence for '{item}' (score={best_score:.2f}); falling back to LLM mapping.")
+    try:
+        # Call the HF API to get similarity scores between the input and each canonical category.
+        result = hf_client.sentence_similarity(
+            model="sentence-transformers/all-MiniLM-L6-v2",
+            inputs={
+                "source_sentence": item,
+                "sentences": canonical_categories
+            },
+            provider="hf-inference",
+        )
+        # Assume `result` is a list of similarity scores (floats).
+        best_score = max(result)
+        best_idx = result.index(best_score)
+        if best_score < threshold:
+            logging.info(f"Low confidence for '{item}' (score={best_score:.2f}); falling back to LLM mapping.")
+            return None
+        return canonical_categories[best_idx]
+    except Exception as e:
+        logging.error(f"Hugging Face Inference error: {e}")
         return None
-    return canonical_categories[best_idx]
 
 # -------------------------------
 # Legacy Category Mapping (Fallback)
@@ -148,6 +127,8 @@ def get_category(item):
 # -------------------------------
 # Helper Function: Convert Number Words to Digits
 # -------------------------------
+from word2number import w2n
+
 def convert_number_words(text):
     number_word_list = [
         "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
@@ -211,6 +192,43 @@ class GroqLLMClient:
 
 
 llm_client = GroqLLMClient(GROQ_API_KEY)
+
+# -------------------------------
+# MongoDB Client Class using PyMongo
+# -------------------------------
+class MongoDBClient:
+    def __init__(self, uri, db_name, collection_name):
+        logging.info(f"Connecting to MongoDB at {uri}...")
+        try:
+            self.client = MongoClient(uri, serverSelectionTimeoutMS=5000, directConnection=False)
+            self.db = self.client[str(db_name)]
+            self.collection = self.db[str(collection_name)]
+            self.client.admin.command("ping")
+            logging.info("✅ Successfully connected to MongoDB!")
+        except Exception as e:
+            logging.error(f"❌ MongoDB Connection Failed: {e}")
+            raise e
+
+    def insert(self, record):
+        result = self.collection.insert_one(record)
+        record["expense_id"] = str(result.inserted_id)
+        return record["expense_id"]
+
+    def find(self, query):
+        results = list(self.collection.find(query))
+        for rec in results:
+            rec["expense_id"] = str(rec.get("_id"))
+        return results
+
+    def delete(self, query):
+        expense_id = query.get("expense_id")
+        if expense_id:
+            from bson.objectid import ObjectId  # Ensure ObjectId is imported
+            result = self.collection.delete_one({"_id": ObjectId(expense_id), "user_id": query.get("user_id")})
+            return result.deleted_count > 0
+        return False
+
+db_client = MongoDBClient(MONGO_URI, MONGO_DB_NAME, MONGO_COLLECTION)
 
 # -------------------------------
 # ExpenseTracker Class
