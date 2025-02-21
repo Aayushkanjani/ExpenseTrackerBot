@@ -509,15 +509,17 @@ def whatsapp_reply():
     user_id = from_number
     logging.info(f"Received WhatsApp message from {user_id}: {incoming_msg}")
     media_url = request.form.get('MediaUrl0', '')
-    media_type = request.form.get('MediaContentType0', '')
-    # If an audio file is provided, download and transcribe it.
-    if media_url and "audio" in media_type.lower():
+    media_type = request.form.get('MediaContentType0', '').lower()
+    
+    # Check if the message contains an audio file that is OGG with opus (or simply ensure it’s a voice note)
+    if media_url and ("audio/ogg" in media_type or "audio/opus" in media_type):
         try:
             incoming_msg = llm_client.transcribe_voice(media_url)
             logging.info(f"Transcribed voice message: {incoming_msg}")
         except Exception as e:
             logging.error(f"Voice transcription failed: {e}")
             incoming_msg = "Voice transcription failed."
+
     response_text = tracker.process_command(incoming_msg, user_id)
     resp = MessagingResponse()
     msg = resp.message()
