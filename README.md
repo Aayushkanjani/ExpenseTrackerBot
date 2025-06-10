@@ -14,7 +14,6 @@ This project is a sophisticated, AI-powered expense tracker that allows users to
 - **Automatic Typo Correction**: Leverages a Groq LLM to correct spelling and grammatical errors in user messages, improving the accuracy of expense logging.
 - **Flexible Date Parsing**: Automatically parses relative dates like "yesterday," "tomorrow," and "day before yesterday" into absolute dates.
 - **MongoDB Integration**: Securely stores and retrieves user expense data using a MongoDB database.
-- **RESTful API**: Includes a `/process_command` endpoint for direct interaction with the expense tracker.
 
 ## How It Works
 
